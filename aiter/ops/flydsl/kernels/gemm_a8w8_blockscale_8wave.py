@@ -732,14 +732,15 @@ def compile_gemm_fp8_8wave(
                     lds_rd_At(tick, m_slice)
                     mfma_scaleA = lds_rd_scale_a(tick, 0, m_slice)
                     if const_expr(m_slice == 0):
-                        mfma_scaleB = Vec.from_elements(
-                            [load_scale_b(ki, 0), load_scale_b(ki, 1)], fx.Float32
-                        )
+                        # mfma_scaleB = Vec.from_elements(
+                        #     [load_scale_b(ki, 0), load_scale_b(ki, 1)], fx.Float32
+                        # )
+                        mfma_scaleB_0 =  load_scale_b(ki, 0)
                         async_copy_Ab(lds_idx=tock, ki=ki + 1)
                     rocdl.sched_barrier(0)
 
                     begin_compute_phase()
-                    fifo_scale_a_0, fifo_scale_b_0 = mfma_scaleA, mfma_scaleB[0]
+                    fifo_scale_a_0, fifo_scale_b_0 = mfma_scaleA, mfma_scaleB_0
                     do_gemm(
                         frag_C_br,
                         frag_B_l,
@@ -752,10 +753,11 @@ def compile_gemm_fp8_8wave(
 
                     if const_expr(m_slice == 0):
                         lds_rd_Br(tick)
+                        mfma_scaleB_1 =  load_scale_b(ki, 1)
                     else:
                         async_copy_At(lds_idx=tick, ki=ki + 2)
 
-                    fifo_scale_a_1, fifo_scale_b_1 = mfma_scaleA, mfma_scaleB[1]
+                    fifo_scale_a_1, fifo_scale_b_1 = mfma_scaleA, mfma_scaleB_1
                     begin_compute_phase()
                     do_gemm(
                         frag_C_tl,
@@ -779,7 +781,7 @@ def compile_gemm_fp8_8wave(
                         # L.BL[s1].end confirm every producer's completion.
                         rocdl.s_waitcnt(vmcnt=vm_load_cnt_a + vm_load_cnt_b * 2)
 
-                    fifo_scale_a_0, fifo_scale_b_0 = mfma_scaleA, mfma_scaleB[0]
+                    fifo_scale_a_0, fifo_scale_b_0 = mfma_scaleA, mfma_scaleB_0
                     begin_compute_phase()
                     do_gemm(
                         frag_C_tr,
@@ -797,7 +799,7 @@ def compile_gemm_fp8_8wave(
                         async_copy_scale_a(lds_idx=tick, ki=ki + 2)
                         lds_rd_Bl(lds_idx=tock)
 
-                    fifo_scale_a_1, fifo_scale_b_1 = mfma_scaleA, mfma_scaleB[1]
+                    fifo_scale_a_1, fifo_scale_b_1 = mfma_scaleA, mfma_scaleB_1
                     begin_compute_phase()
                     do_gemm(
                         frag_C_bl,
