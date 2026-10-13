@@ -57,11 +57,11 @@ def compile_gemm_fp8_8wave(
 ):
     """Compile the half-M single-FIFO blockscale kernel with raw A/B DMA.
 
-    Scalar B scales, one-phase-ahead B_l reads, and four scalar FMAs per new
+    VGPR B scales, one-phase-ahead B_l reads, and four unpacked FMAs per new
     MFMA retain the validated split pipeline. There are no s_setprio changes.
     preshuffle_b uses the FP8 (16, 16) weight shuffle, without gate/up interleave.
     Its coalesced raw B DMA retains the plain path's load count and scheduling.
-    B scales use scalar buffer loads directly, without LDS staging.
+    B scales are staged once in the prologue and read from LDS into VGPRs.
     """
     assert (TILE_M, TILE_N, TILE_K) == (256, 256, 128)
     if preshuffle_b:
@@ -83,6 +83,7 @@ def compile_gemm_fp8_8wave(
     scaleA_stride = K // 128
     scaleB_rows = TILE_N // 128
     scaleB_elems = scaleB_rows * scaleA_stride
+    scaleB_lds_elems = div_up(scaleB_elems, 512) * 512
 
     def _get_pids_950(pid, M, GRID_MN, NUM_XCDS, GROUP_SIZE_M):
         num_pid_m = (M + TILE_M - 1) // TILE_M
@@ -123,7 +124,9 @@ def compile_gemm_fp8_8wave(
     a_lds_elems = (BLOCK_M // 16) * (2 * A_GROUP + 32)
 
     # A/B ping-pong tiles use 132 KiB; ScaleA uses another 4 KiB.
-    # ScaleB is wave-uniform and stays on the scalar global-memory path.
+    # Stage both N-block rows of ScaleB for all K iterations.
+    assert 8 * a_lds_elems + 2 * 512 * 4 + scaleB_lds_elems * 4 <= 160 * 1024
+
     @fx.struct
     class LDS:
         a_t0: fx.Array[Float8E4M3FN, a_lds_elems, 16]
@@ -137,6 +140,7 @@ def compile_gemm_fp8_8wave(
         # scale a ping-pong LDS
         scale_a0: fx.Array[Float32, 512, 4]
         scale_a1: fx.Array[Float32, 512, 4]
+        scale_b: fx.Array[Float32, scaleB_lds_elems, 8]
 
     @flyc.kernel(known_block_size=[512, 1, 1])
     def gemm_kernel(
@@ -197,13 +201,39 @@ def compile_gemm_fp8_8wave(
         ### Allocate LDS.
         lds = fx.SharedAllocator().allocate(LDS).peek()
 
-        # ScaleB still needs a global descriptor for the two scalar K-tile loads.
-        scaleB_rsrc = _buffer_resource(
-            argScaleB,
-            num_records_bytes=arith._to_raw(
-                fx.Int32(div_up(N, 128) * scaleA_stride * 4)
-            ),
-        )
+        def _load_scale_b_to_lds():
+            """Stage ScaleB as [KB, 2], pairing the left/right scales in LDS."""
+            scaleB_rsrc = _buffer_resource(
+                argScaleB,
+                num_records_bytes=arith._to_raw(
+                    fx.Int32(div_up(N, 128) * scaleA_stride * 4)
+                ),
+            )
+            scale_b_global_base = fx.Int32(bid_y * scaleB_elems * 4)
+            wave_byte_offset = rocdl.readfirstlane(
+                T.i32, arith._to_raw(fx.Int32(wave_id * 64 * 4))
+            )
+            # Padded full-WG rounds avoid a divergent tail. The descriptor
+            # zero-fills padding and missing N-block rows, without extra waits.
+            for start in range_constexpr(0, scaleB_lds_elems, 512):
+                elem = tid + start
+                source = (elem % 2) * scaleA_stride + elem // 2
+                lane_byte_offset = (elem < scaleB_elems).select(
+                    fx.Int32(source * 4), fx.Int32(0x7FFFFFFF)
+                )
+                rocdl.raw_ptr_buffer_load_lds(
+                    scaleB_rsrc,
+                    _lds_byte_ptr(lds.scale_b.ptr, wave_byte_offset + start * 4),
+                    fx.Int32(4),
+                    lane_byte_offset,
+                    scale_b_global_base,
+                    fx.Int32(0),
+                    fx.Int32(0),
+                )
+
+        # Enqueue before building MMA fragments; the existing prologue waits
+        # complete this preload without changing the staggered pipeline.
+        _load_scale_b_to_lds()
 
         ### read LDS layout and write LDS layout. AC copy tile
         ### LDS using dual padding to avoid swizzle. each 8 rows padded 16 elements and each 16 rows padded another 32 elements.
@@ -345,27 +375,15 @@ def compile_gemm_fp8_8wave(
                 fx.Int32(0),
             )
 
-        def load_scale_b(ki):
-            addr = fx.Int32((bid_y * scaleB_elems + ki) * 4)
-            result_type = ir.Type.parse("!llvm.struct<(f32, f32)>")
-            result = _llvm.inline_asm(
-                result_type,
-                [
-                    arith._to_raw(scaleB_rsrc),
-                    arith._to_raw(addr),
-                    arith._to_raw(addr + scaleA_stride * 4),
-                ],
-                "s_buffer_load_dword $0, $2, $3\n" "s_buffer_load_dword $1, $2, $4",
-                "=&s,=&s,s,s,s,~{memory}",
-                has_side_effects=True,
+        def load_scale_b(ki, quadrant):
+            # One wave-uniform scale, read by every lane into a VGPR.
+            scale_src = fx.make_view(
+                fx.add_offset(lds.scale_b.ptr, ki * scaleB_rows + quadrant),
+                fx.make_layout(1, 1),
             )
-            return Vec.from_elements(
-                [
-                    fx.Float32(_llvm.extractvalue(T.f32, result, [0])),
-                    fx.Float32(_llvm.extractvalue(T.f32, result, [1])),
-                ],
-                fx.Float32,
-            )
+            scale_frag = fx.make_fragment_like(scale_src)
+            fx.copy(scale_lds_copy_atom, scale_src, scale_frag)
+            return Vec(scale_frag.load())[0]
 
         def lds_rd_scale_a(buf, bottom, m_slice=0):
             half_offset = bottom * BLOCK_M
@@ -409,7 +427,7 @@ def compile_gemm_fp8_8wave(
             # additive physical VGPR allocations. A storage is reused across
             # M slices; both B fragments and all four C quadrants stay live.
             # One P FIFO is reused across slices/quadrants. dq_scale_a has
-            # two f32 values; dq_scale_b is one wave-uniform scalar.
+            # two f32 VGPR values; dq_scale_b is one wave-uniform VGPR.
 
             # for mm in (Mrep):
             #   dq_scale = dq_scale_a[mm] *dq_scale_b
@@ -422,11 +440,12 @@ def compile_gemm_fp8_8wave(
             #       frag_P[0:3, nn, mm] = mfma_16x16x128(frag_A[:, mm], frag_B[:, nn], 0)
 
             #
-            # Compiler-only sched_barrier fences preserve 4 scalar FMAs ->
+            # Compiler-only sched_barrier fences preserve 4 unpacked FMAs ->
             # 1 MFMA; the launch's -packed-fp32-ops disables FP32 packing.
             # This compute block uses fx.fma and the MFMA intrinsic, not
             # inline asm/early-clobber constraints. WG sync stays in the caller.
             for m0 in range_constexpr(PHASE_M_REP):
+                # Both operands now come from LDS into VGPRs; no ScaleB SGPR.
                 dq_scale = Vec(dq_scale_a)[m0] * dq_scale_b
                 rocdl.sched_barrier(0)
                 for n0 in range_constexpr(N_REP):
@@ -701,7 +720,7 @@ def compile_gemm_fp8_8wave(
             # | BL s1 | A11*B0   | TR s1       | A11, SA11 (t)   | vmcnt(6)             |
             # | BR s1 | A11*B1   | BL s1       | B0 (u,k+1)      | SA (t,k+2), before LR|
             # Every phase: LR/AC/wait -> lgkmcnt(0) -> s_barrier -> DOT -> s_barrier.
-            # TL s0 also loads two ScaleB SGPRs (SMEM, not LDS/AC).
+            # TL s0 also reads the two preloaded ScaleB values into VGPRs.
             # B0(k=0) is read in the prologue; the first DQ retires zero.
             # BR s1's pending partial is retired by the next TL s0, or the epilogue.
 
@@ -713,7 +732,9 @@ def compile_gemm_fp8_8wave(
                     lds_rd_At(tick, m_slice)
                     mfma_scaleA = lds_rd_scale_a(tick, 0, m_slice)
                     if const_expr(m_slice == 0):
-                        mfma_scaleB = load_scale_b(ki=ki)
+                        mfma_scaleB = Vec.from_elements(
+                            [load_scale_b(ki, 0), load_scale_b(ki, 1)], fx.Float32
+                        )
                         async_copy_Ab(lds_idx=tock, ki=ki + 1)
                     rocdl.sched_barrier(0)
 

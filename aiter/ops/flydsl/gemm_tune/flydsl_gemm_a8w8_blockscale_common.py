@@ -40,8 +40,9 @@ kernels_by_name = {ki.name: ki for ki in kernels_list.values()}
 
 def lds_bytes(K: int) -> int:
     # Eight padded 128x128 FP8 buffers and two 512-f32 A-scale buffers.
-    # ScaleB uses scalar global loads; LDS no longer grows with K.
-    return 8 * 16896 + 2 * 512 * 4
+    # ScaleB is staged in complete 512-lane DMA rounds, including padding.
+    scale_b_elems = (TILE_N // 128) * (K // 128)
+    return 8 * 16896 + 2 * 512 * 4 + ((scale_b_elems + 511) // 512) * 512 * 4
 
 
 def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int, gfx: str) -> bool:
