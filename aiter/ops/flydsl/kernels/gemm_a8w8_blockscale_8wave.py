@@ -316,8 +316,7 @@ def compile_gemm_fp8_8wave(
             return _lds_byte_ptr(fx.get_iter(root_view), byte_offset)
 
         scale_row = tid % TILE_M
-        scale_lane_src_offset = scale_row * 4
-        scale_src_tile_base = bid_x * TILE_M * 4
+        scale_voffset = (bid_x * TILE_M + scale_row) * 4
 
         def async_copy_scale_a(lds_idx, ki):
             scale_dst = _scale_dst_ptr(scale_a_lds[lds_idx], scale_wave_dst_offset)
@@ -325,8 +324,8 @@ def compile_gemm_fp8_8wave(
                 scaleA_rsrc,
                 scale_dst,
                 fx.Int32(4),
-                scale_lane_src_offset,
-                scale_src_tile_base + ki * M * 4,
+                scale_voffset,
+                ki * M * 4,
                 fx.Int32(0),
                 fx.Int32(0),
             )
@@ -558,23 +557,29 @@ def compile_gemm_fp8_8wave(
         # 2 contineous lane-rows would have load A/B with stride of 16m/16n.
         a_local_row = a_lane_row % 8 * (BLOCK_M // 8) + a_lane_row // 8
         lane_src_offset = (a_local_row * K + a_lane_k) * _elem_bytes
-        aT_src_wave_base = fx.Int32(0)
-        bL_src_wave_base = fx.Int32(0)
+        # Loop-invariant row offsets live in voffset; soffset only steps K.
+        # [half][chunk]: [top/bottom (left/right) half] [repetition], then the +8-row pass.
+        g2s_voffset = [
+            [
+                lane_src_offset
+                + fx.Int32((half * BLOCK_M + chunk * 8) * K * _elem_bytes)
+                for chunk in range_constexpr(BLOCK_M // 64)
+            ]
+            for half in range_constexpr(2)
+        ]
 
-        def raw_g2s(rsrc, dst_base, src_wave_base, ki):
+        def raw_g2s(rsrc, dst_base, half, ki):
+            src_soffset = fx.Int32(ki * BLOCK_K * _elem_bytes)
             for chunk in range_constexpr(BLOCK_M // 64):
                 dest_lds_m0 = _lds_byte_ptr(
                     dst_base,
                     chunk * _dst_stride * _elem_bytes,
                 )
-                src_soffset = src_wave_base + fx.Int32(
-                    ki * BLOCK_K * _elem_bytes + chunk * 8 * K * _elem_bytes
-                )
                 rocdl.raw_ptr_buffer_load_lds(
                     rsrc,
                     dest_lds_m0,
                     fx.Int32(16),
-                    lane_src_offset,
+                    g2s_voffset[half][chunk],
                     src_soffset,
                     fx.Int32(0),
                     fx.Int32(0),
@@ -590,55 +595,49 @@ def compile_gemm_fp8_8wave(
             src_voffset = (
                 (wave_id // 2) * 16 * K + (wave_id % 2) * 1024 + (tid % 64) * 16
             )
+            # [quadrant][chunk]: 128-row quadrant, then the 64-row pass.
+            preshuffle_voffset = [
+                [
+                    src_voffset + fx.Int32((quadrant * BLOCK_N + chunk * 64) * K)
+                    for chunk in range_constexpr(2)
+                ]
+                for quadrant in range_constexpr(2)
+            ]
             lds_wave_offset = rocdl.readfirstlane(T.i32, (wave_id * 1024).ir_value())
 
             def preshuffle_g2s(root_view, quadrant, ki):
+                src_soffset = fx.Int32(ki * BLOCK_K * 16)
                 for chunk in range_constexpr(2):
                     dest_lds_m0 = _lds_byte_ptr(
                         fx.get_iter(root_view), lds_wave_offset + chunk * 8192
                     )
-                    vmem_scalar_offset = (
-                        quadrant * BLOCK_N + chunk * 64
-                    ) * K + ki * BLOCK_K * 16
-
-                    src_soffset = vmem_scalar_offset
                     rocdl.raw_ptr_buffer_load_lds(
                         b_dma_rsrc,
                         dest_lds_m0,
                         fx.Int32(16),
-                        src_voffset,
+                        preshuffle_voffset[quadrant][chunk],
                         src_soffset,
                         fx.Int32(0),
                         fx.Int32(0),
                     )
 
         def async_copy_At(lds_idx, ki):
-            raw_g2s(a_dma_rsrc, dma_aT_dst[lds_idx], aT_src_wave_base, ki)
+            raw_g2s(a_dma_rsrc, dma_aT_dst[lds_idx], 0, ki)
 
         def async_copy_Ab(lds_idx, ki):
-            raw_g2s(
-                a_dma_rsrc,
-                dma_aB_dst[lds_idx],
-                aT_src_wave_base + BLOCK_M * K * _elem_bytes,
-                ki,
-            )
+            raw_g2s(a_dma_rsrc, dma_aB_dst[lds_idx], 1, ki)
 
         def async_copy_Bl(lds_idx, ki):
             if const_expr(preshuffle_b):
                 preshuffle_g2s(ldsB_l_rd[lds_idx], 0, ki)
             else:
-                raw_g2s(b_dma_rsrc, dma_bL_dst[lds_idx], bL_src_wave_base, ki)
+                raw_g2s(b_dma_rsrc, dma_bL_dst[lds_idx], 0, ki)
 
         def async_copy_Br(lds_idx, ki):
             if const_expr(preshuffle_b):
                 preshuffle_g2s(ldsB_r_rd[lds_idx], 1, ki)
             else:
-                raw_g2s(
-                    b_dma_rsrc,
-                    dma_bR_dst[lds_idx],
-                    bL_src_wave_base + BLOCK_N * K * _elem_bytes,
-                    ki,
-                )
+                raw_g2s(b_dma_rsrc, dma_bR_dst[lds_idx], 1, ki)
 
         rocdl.sched_barrier(0)
         async_copy_scale_a(lds_idx=0, ki=fx.Int32(0))
